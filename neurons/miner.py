@@ -11,6 +11,7 @@ import threading
 import copy
 import asyncio
 import logging
+from datetime import datetime, timezone
 import bittensor as bt
 
 # Bittensor Miner Template:
@@ -22,16 +23,42 @@ from alpharidge_ai import config as ar_config
 from alpharidge_ai.utils.api_models import TweetAnalysisBase, TelegramMessageAnalysis, NewsArticleAnalysisBase
 
 _THIN = bool(getattr(ar_config, "INFERENCE_POOL_URL", "") or "")
-_ALLOW_THIN = ("Received ", "Submitted successfully")
+_ALLOW_THIN = ("[ARTICLE]",)
+
+
+def _simple_reason(err, fallback: str = "unknown") -> str:
+    """One-line failure reason for PM2 logs (no newlines / huge traces)."""
+    if err is None:
+        return fallback
+    if isinstance(err, BaseException):
+        text = f"{type(err).__name__}: {err}"
+    else:
+        text = str(err).strip() or fallback
+    text = " ".join(text.split())
+    if len(text) > 180:
+        text = text[:177] + "..."
+    return text
+
+
+def _article_log(event: str, **fields) -> None:
+    """Emit concise article lifecycle logs regardless of Bittensor log level."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Keep failure reasons first and always present for *failed* / *timeout* events.
+    if "failed" in event or "timeout" in event or "partial" in event or event.endswith("unavailable"):
+        reason = fields.pop("reason", None)
+        fields = {"reason": _simple_reason(reason), **fields}
+    details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
+    line = f"{timestamp} [ARTICLE] {event}"
+    if details:
+        line = f"{line} {details}"
+    print(line, flush=True)
 
 
 def _quiet_thin_logging():
-    """Only surface Received / Submitted successfully (+ errors) in thin-miner PM2 logs."""
+    """Suppress framework chatter; article lifecycle uses always-on stdout logs."""
 
     class _Filter(logging.Filter):
         def filter(self, record: logging.LogRecord) -> bool:
-            if record.levelno >= logging.ERROR:
-                return True
             try:
                 msg = record.getMessage()
             except Exception:
@@ -47,7 +74,7 @@ def _quiet_thin_logging():
         for h in list(lg.handlers):
             h.addFilter(flt)
 
-    # bt.logging often bypasses stdlib filters — wrap info/success/warning.
+    # bt.logging often bypasses stdlib filters. Article lifecycle does not use it.
     def _wrap(fn):
         def _inner(msg, *args, **kwargs):
             s = str(msg)
@@ -57,7 +84,7 @@ def _quiet_thin_logging():
 
         return _inner
 
-    for attr in ("info", "success", "debug", "trace", "warning"):
+    for attr in ("info", "success", "debug", "trace", "warning", "error", "critical"):
         if hasattr(bt.logging, attr):
             setattr(bt.logging, attr, _wrap(getattr(bt.logging, attr)))
 
@@ -106,8 +133,10 @@ class Miner(BaseMinerNeuron):
                     f"[Miner] Thin mode → pool {ar_config.INFERENCE_POOL_URL} health={health.get('ok')}"
                 )
             except Exception as e:
-                bt.logging.error(
-                    f"[Miner] Inference pool unreachable at {ar_config.INFERENCE_POOL_URL}: {e}"
+                _article_log(
+                    "pool_unavailable",
+                    reason=e,
+                    url=ar_config.INFERENCE_POOL_URL,
                 )
                 raise
         else:
@@ -232,8 +261,10 @@ class Miner(BaseMinerNeuron):
         self, synapse: alpharidge_ai.protocol.ArticleBatch
     ) -> alpharidge_ai.protocol.ArticleBatch:
         validator_hotkey = synapse.dendrite.hotkey if synapse.dendrite else None
-        bt.logging.info(
-            f"[Miner] Received ArticleBatch with {len(synapse.article_batch)} article(s) from validator {validator_hotkey}"
+        _article_log(
+            "received",
+            count=len(synapse.article_batch),
+            validator=validator_hotkey,
         )
         if not validator_hotkey:
             return synapse
@@ -249,7 +280,16 @@ class Miner(BaseMinerNeuron):
         try:
             validator_uid = self.metagraph.hotkeys.index(validator_hotkey)
         except ValueError:
-            bt.logging.error(f"[Miner] Validator hotkey {validator_hotkey} not found in metagraph")
+            if label == "ArticleBatch":
+                _article_log(
+                    "submit_failed",
+                    validator=validator_hotkey,
+                    reason="validator_not_in_metagraph",
+                )
+            else:
+                bt.logging.error(
+                    f"[Miner] Validator hotkey {validator_hotkey} not found in metagraph"
+                )
             return False
         validator_axon = self.metagraph.axons[validator_uid]
         loop = asyncio.new_event_loop()
@@ -278,16 +318,32 @@ class Miner(BaseMinerNeuron):
             except Exception:
                 status_code, status_msg = None, None
             if status_code != 200:
-                bt.logging.error(
-                    f"[Miner] Validator response failed (status={status_code}): {status_msg}"
-                )
+                if label == "ArticleBatch":
+                    _article_log(
+                        "submit_failed",
+                        reason=status_msg or f"validator_status_{status_code}",
+                        validator=validator_hotkey,
+                        status=status_code,
+                    )
+                else:
+                    bt.logging.error(
+                        f"[Miner] Validator response failed (status={status_code}): {status_msg}"
+                    )
             else:
-                bt.logging.info(
-                    f"[Miner] Submitted successfully {label} to validator {validator_hotkey}"
-                )
+                if label == "ArticleBatch":
+                    _article_log("submitted", validator=validator_hotkey, status=status_code)
+                else:
+                    bt.logging.info(
+                        f"[Miner] Submitted successfully {label} to validator {validator_hotkey}"
+                    )
                 ok = True
         except Exception as e:
-            bt.logging.error(f"[Miner] Failed to send {label} to validator: {e}")
+            if label == "ArticleBatch":
+                name = type(e).__name__
+                event = "submit_timeout" if "timeout" in name.lower() or "timed out" in str(e).lower() else "submit_failed"
+                _article_log(event, reason=e, validator=validator_hotkey)
+            else:
+                bt.logging.error(f"[Miner] Failed to send {label} to validator: {e}")
         finally:
             try:
                 if dendrite is not None:
@@ -473,6 +529,7 @@ class Miner(BaseMinerNeuron):
     def _process_and_send_articles(
         self, synapse: alpharidge_ai.protocol.ArticleBatch, validator_hotkey: str
     ):
+        started_at = time.monotonic()
         try:
             if self.pool is not None:
                 articles = []
@@ -555,6 +612,24 @@ class Miner(BaseMinerNeuron):
                         relevance_confidence=classification.relevance_confidence,
                     )
 
+            solved = sum(1 for article in synapse.article_batch if article.analysis is not None)
+            total = len(synapse.article_batch)
+            _article_log(
+                "solved",
+                count=solved,
+                total=total,
+                seconds=f"{time.monotonic() - started_at:.1f}",
+                validator=validator_hotkey,
+            )
+            if total and solved < total:
+                _article_log(
+                    "solve_partial",
+                    reason=f"missing_analysis {total - solved}/{total}",
+                    count=solved,
+                    total=total,
+                    validator=validator_hotkey,
+                )
+
             from alpharidge_ai.utils.miner_signing import sign_items
 
             miner_signatures, nonces = sign_items(
@@ -564,7 +639,15 @@ class Miner(BaseMinerNeuron):
             synapse.nonces = nonces
             self._send_synapse(synapse, validator_hotkey, "ArticleBatch")
         except Exception as e:
-            bt.logging.error(f"[Miner] Error processing articles: {e}")
+            name = type(e).__name__
+            event = "solve_timeout" if "timeout" in name.lower() or "timed out" in str(e).lower() else "solve_failed"
+            _article_log(
+                event,
+                reason=e,
+                count=len(synapse.article_batch),
+                seconds=f"{time.monotonic() - started_at:.1f}",
+                validator=validator_hotkey,
+            )
 
     async def forward_score(self, synapse: alpharidge_ai.protocol.Score) -> alpharidge_ai.protocol.Score:
         if _THIN:
