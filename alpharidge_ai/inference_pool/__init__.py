@@ -120,11 +120,16 @@ def get_engine() -> InferenceEngine:
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, body: dict):
     data = json.dumps(body, default=str).encode("utf-8")
-    handler.send_response(code)
-    handler.send_header("Content-Type", "application/json")
-    handler.send_header("Content-Length", str(len(data)))
-    handler.end_headers()
-    handler.wfile.write(data)
+    try:
+        handler.send_response(code)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+        # Thin miner timed out / restarted while we were still analyzing.
+        # Work is done; don't escalate into a secondary 500 write attempt.
+        log.warning("client disconnected during response: %s", e)
 
 
 def _read_json(handler: BaseHTTPRequestHandler) -> dict:
@@ -180,6 +185,8 @@ class PoolHandler(BaseHTTPRequestHandler):
                 self._articles_batch(body)
             else:
                 _json_response(self, 404, {"ok": False, "error": "not_found"})
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+            log.warning("client disconnected path=%s: %s", path, e)
         except Exception as e:
             log.error("handler error path=%s: %s", path, e)
             _json_response(self, 500, {"ok": False, "error": str(e)})

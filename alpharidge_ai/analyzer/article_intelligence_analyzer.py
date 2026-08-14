@@ -683,7 +683,9 @@ class ArticleIntelligenceAnalyzer:
             if not tc:
                 bt.logging.warning(f"[ARTICLE_INTEL] {tool_name}: no tool calls returned")
                 return {}
-            return json.loads(tc[0].function.arguments)
+            parsed = json.loads(tc[0].function.arguments)
+            # Models occasionally return a bare list/string instead of the tool schema object.
+            return parsed if isinstance(parsed, dict) else {}
         except Exception as e:
             bt.logging.warning(f"[ARTICLE_INTEL] {tool_name} failed: {e}")
             return {}
@@ -729,17 +731,40 @@ class ArticleIntelligenceAnalyzer:
                      if e.entity_type in ("person", "regulatory_body", "organization")]
         if entities:
             lines.append("Entities: " + ", ".join(f"{n} ({t})" for n, t in entities[:8]))
-        econ = call1.get("economic_data", [])
-        if econ:
+        # LLM tool JSON is often malformed (strings instead of objects, truncated
+        # arrays). Never let a bad item abort the whole article — that returns
+        # None upstream and costs every thin miner points for an otherwise-valid
+        # triage+NER path.
+        econ = call1.get("economic_data") or []
+        if isinstance(econ, list):
             parts = []
             for d in econ[:5]:
-                actual = f"{d.get('actual_value', '?')}" if d.get("actual_value") is not None else "?"
-                parts.append(f"{d.get('event_name', '?')}: {actual} {d.get('unit', '')}")
-            lines.append("Economic Data: " + " | ".join(parts))
-        quotes = call1.get("quotes", [])
-        if quotes:
+                if isinstance(d, str) and d.strip():
+                    parts.append(d.strip()[:120])
+                    continue
+                if not isinstance(d, dict):
+                    continue
+                actual = (
+                    f"{d.get('actual_value', '?')}"
+                    if d.get("actual_value") is not None
+                    else "?"
+                )
+                parts.append(f"{d.get('event_name', '?')}: {actual} {d.get('unit', '')}".strip())
+            if parts:
+                lines.append("Economic Data: " + " | ".join(parts))
+        elif isinstance(econ, str) and econ.strip():
+            lines.append(f"Economic Data: {econ.strip()[:200]}")
+        quotes = call1.get("quotes") or []
+        if isinstance(quotes, list):
             for q in quotes[:2]:
-                lines.append(f"Quote: {q.get('speaker', '?')}: \"{q.get('text', '')[:100]}\"")
+                if isinstance(q, str) and q.strip():
+                    lines.append(f"Quote: \"{q.strip()[:100]}\"")
+                    continue
+                if not isinstance(q, dict):
+                    continue
+                lines.append(
+                    f"Quote: {q.get('speaker', '?')}: \"{(q.get('text') or '')[:100]}\""
+                )
         sents = ner_result.sentence_sentiments[:3]
         if sents:
             lines.append("FinBERT hints: " + ", ".join(f"{s['sentiment']}({s['score']:.2f})" for s in sents))
@@ -877,7 +902,11 @@ class ArticleIntelligenceAnalyzer:
 
     def _build_economic_data(self, raw: list) -> List[EconomicDataPoint]:
         points = []
-        for d in (raw or [])[:5]:
+        if not isinstance(raw, list):
+            return points
+        for d in raw[:5]:
+            if not isinstance(d, dict):
+                continue
             try:
                 actual = d.get("actual_value")
                 expected = d.get("expected_value")
@@ -897,7 +926,11 @@ class ArticleIntelligenceAnalyzer:
 
     def _build_numeric_claims(self, raw: list) -> List[NumericClaim]:
         claims = []
-        for c in (raw or [])[:10]:
+        if not isinstance(raw, list):
+            return claims
+        for c in raw[:10]:
+            if not isinstance(c, dict):
+                continue
             try:
                 claims.append(NumericClaim(
                     metric_name=c["metric_name"], value=c["value"],
@@ -911,7 +944,11 @@ class ArticleIntelligenceAnalyzer:
 
     def _build_quotes(self, raw: list) -> List[QuoteExtraction]:
         quotes = []
-        for q in (raw or [])[:5]:
+        if not isinstance(raw, list):
+            return quotes
+        for q in raw[:5]:
+            if not isinstance(q, dict):
+                continue
             try:
                 quotes.append(QuoteExtraction(
                     speaker=q["speaker"], speaker_title=q.get("speaker_title"),
