@@ -678,7 +678,6 @@ class ArticleIntelligenceAnalyzer:
                 tool_choice={"type": "function", "function": {"name": tool_name}},
                 temperature=0,
                 max_tokens=4000,
-                extra_body={"provider": {"sort": "latency"}},
             )
             tc = response.choices[0].message.tool_calls
             if not tc:

@@ -5,7 +5,12 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from alpharidge_ai.models.article_intelligence import SCHEMA_VERSION
-from alpharidge_ai.triage import TRIAGE_SCHEMA_VERSION
+from alpharidge_ai.triage import (
+    FLAG_DISCARD,
+    FLAG_VALUABLE,
+    TRIAGE_SCHEMA_VERSION,
+    analysis_indicates_value,
+)
 
 
 def intel_to_analysis_dict(
@@ -17,6 +22,11 @@ def intel_to_analysis_dict(
     """Build NewsArticleAnalysisBase kwargs (plus analysisData) from ArticleIntelligence."""
     analysis_blob = intel.model_dump()
     if triage_rec is not None:
+        triage_rec = dict(triage_rec)
+        if triage_rec.get("label") == "borderline":
+            triage_rec["flag"] = (
+                FLAG_VALUABLE if analysis_indicates_value(analysis_blob) else FLAG_DISCARD
+            )
         analysis_blob["triage_schema_version"] = TRIAGE_SCHEMA_VERSION
         analysis_blob["triage"] = triage_rec
         analysis_blob["proof_of_read"] = proof

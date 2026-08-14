@@ -338,7 +338,6 @@ Pick the MOST SPECIFIC category:
                 tool_choice={"type": "function", "function": {"name": "classify_article_content_type"}},
                 temperature=0,
                 max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("content_type", "other")
@@ -366,7 +365,6 @@ Pick the MOST SPECIFIC category:
                 tool_choice={"type": "function", "function": {"name": "classify_sentiment"}},
                 temperature=0,
                 max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("sentiment", "neutral")
@@ -393,7 +391,6 @@ Pick the MOST SPECIFIC category:
                 tool_choice={"type": "function", "function": {"name": "assess_technical_quality"}},
                 temperature=0,
                 max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("quality", "none")
@@ -421,7 +418,6 @@ Pick the MOST SPECIFIC category:
                 tool_choice={"type": "function", "function": {"name": "classify_market_analysis"}},
                 temperature=0,
                 max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("analysis_type", "other")
@@ -448,7 +444,6 @@ Pick the MOST SPECIFIC category:
                 tool_choice={"type": "function", "function": {"name": "assess_impact"}},
                 temperature=0,
                 max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("impact", "NONE")

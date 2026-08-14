@@ -469,8 +469,7 @@ class TelegramRelevanceAnalyzer:
                 tools=[SENTIMENT_TOOL],
                 tool_choice={"type": "function", "function": {"name": "classify_sentiment"}},
                 temperature=0,
-                max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
+                max_tokens=50
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return Sentiment(args.get("sentiment", "neutral"))
@@ -507,8 +506,7 @@ Pick the MOST SPECIFIC category that applies:
                 tools=[CONTENT_TYPE_TOOL],
                 tool_choice={"type": "function", "function": {"name": "classify_content_type"}},
                 temperature=0,
-                max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
+                max_tokens=50
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("content_type", "other")
@@ -535,8 +533,7 @@ Choose the sentiment that best matches the overall tone:
                 tools=[SENTIMENT_TOOL],
                 tool_choice={"type": "function", "function": {"name": "classify_sentiment"}},
                 temperature=0,
-                max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
+                max_tokens=50
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("sentiment", "neutral")
@@ -561,8 +558,7 @@ Choose the sentiment that best matches the overall tone:
                 tools=[TECHNICAL_QUALITY_TOOL],
                 tool_choice={"type": "function", "function": {"name": "assess_technical_quality"}},
                 temperature=0,
-                max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
+                max_tokens=50
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("quality", "none")
@@ -588,8 +584,7 @@ Choose the sentiment that best matches the overall tone:
                 tools=[MARKET_ANALYSIS_TOOL],
                 tool_choice={"type": "function", "function": {"name": "classify_market_analysis"}},
                 temperature=0,
-                max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
+                max_tokens=50
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("analysis_type", "other")
@@ -614,8 +609,7 @@ Choose the sentiment that best matches the overall tone:
                 tools=[IMPACT_TOOL],
                 tool_choice={"type": "function", "function": {"name": "assess_impact"}},
                 temperature=0,
-                max_tokens=50,
-                extra_body={"provider": {"sort": "latency"}},
+                max_tokens=50
             )
             args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
             return args.get("impact", "NONE")

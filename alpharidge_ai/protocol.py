@@ -51,7 +51,7 @@ class IsAlive(bt.Synapse):
     """
     Synapse for sending is alive signal from miner to validator.
     """
-    is_alive: bool = False
+    is_alive: bool 
     
 class TweetBatch(bt.Synapse):
     """Synapse for sending tweet batch from miner to validator."""

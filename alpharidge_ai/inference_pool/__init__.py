@@ -40,23 +40,30 @@ class InferenceEngine:
         self.tweet_analyzer = setup_analyzer()
         self.telegram_analyzer = setup_telegram_analyzer()
         self.news_analyzer = setup_news_analyzer()
-        self.article_intel = None
+
+        # V2 + triage are mandatory (subnet 3.5.0); fail startup rather than
+        # silently falling back.
         try:
             self.article_intel = setup_article_intelligence_analyzer()
+            log.info("article intel ready")
         except Exception as e:
-            log.error("article intel init failed: %s", e)
-        self.triage_stage = None
+            raise RuntimeError(
+                "ArticleIntelligence (V2) analyzer failed to initialize; "
+                f"triage requires V2. Fix analyzer setup and restart: {e}"
+            ) from e
+
         try:
-            from alpharidge_ai import config as ar_config
+            from alpharidge_ai.analyzer.asset_extractor import AssetExtractor
+            from alpharidge_ai.analyzer.triage_stage import TriageStage
 
-            if getattr(ar_config, "MINER_TRIAGE_ENABLED", False) and self.article_intel is not None:
-                from alpharidge_ai.analyzer.asset_extractor import AssetExtractor
-                from alpharidge_ai.analyzer.triage_stage import TriageStage
-
-                self.triage_stage = TriageStage(AssetExtractor())
-                log.info("triage enabled")
+            self.triage_stage = TriageStage(AssetExtractor())
+            log.info("triage ready")
         except Exception as e:
-            log.warning("triage init failed: %s", e)
+            raise RuntimeError(
+                "Triage stage failed to initialize (asset gazetteer or language "
+                f"detector). Fix the named component and restart: {e}"
+            ) from e
+
         log.info("analyzers ready in %.1fs", time.time() - t0)
 
     def submit(self, fn, *args, **kwargs):
@@ -73,47 +80,32 @@ class InferenceEngine:
         return c.to_dict() if c is not None else None
 
     def analyze_article(self, payload: dict) -> Optional[dict]:
+        """Match neurons/miner.py 3.5.0 article path (mandatory triage)."""
         title = payload.get("title") or ""
-        if not title:
-            return None
         content = payload.get("content") or ""
-        triage_enabled = bool(payload.get("triage_enabled"))
-        triage_rec = proof = None
-        if triage_enabled and self.triage_stage is not None:
-            triage_rec, proof, _ = self.triage_stage.evaluate(title, content)
-            if triage_rec.get("label") != "relevant":
-                return triage_only_analysis_dict(triage_rec, proof)
 
-        if self.article_intel is not None:
-            intel = self.article_intel.analyze(
-                article_id=payload.get("article_id"),
-                url=payload.get("url"),
-                title=title,
-                source=payload.get("source"),
-                published=payload.get("published"),
-                summary=payload.get("summary"),
-                content=content,
-                raw_html=payload.get("raw_html"),
-                miner_hotkey=payload.get("miner_hotkey"),
-            )
-            if intel is not None:
-                return intel_to_analysis_dict(intel, triage_rec=triage_rec, proof=proof)
+        triage_rec, proof, _ = self.triage_stage.evaluate(title, content)
 
-        classification = self.news_analyzer.classify_article(
-            title, payload.get("summary"), content
+        # Titleless / irrelevant → claim + proof only (keeps batch complete).
+        if not title or triage_rec.get("label") == "irrelevant":
+            return triage_only_analysis_dict(triage_rec, proof)
+
+        # Relevant and borderline get full analysis; borderline is flagged after.
+        intel = self.article_intel.analyze(
+            article_id=payload.get("article_id"),
+            url=payload.get("url"),
+            title=title,
+            source=payload.get("source"),
+            published=payload.get("published"),
+            summary=payload.get("summary"),
+            content=content,
+            raw_html=payload.get("raw_html"),
+            miner_hotkey=payload.get("miner_hotkey"),
         )
-        if classification is None:
-            return None
-        return {
-            "sentiment": classification.sentiment.value,
-            "sector_id": classification.sector_id,
-            "sector_symbol": classification.sector_symbol,
-            "content_type": classification.content_type.value,
-            "technical_quality": classification.technical_quality.value,
-            "market_analysis": classification.market_analysis.value,
-            "impact_potential": classification.impact_potential.value,
-            "relevance_confidence": classification.relevance_confidence,
-        }
+        if intel is None:
+            return triage_only_analysis_dict(triage_rec, proof)
+
+        return intel_to_analysis_dict(intel, triage_rec=triage_rec, proof=proof)
 
 
 _ENGINE: Optional[InferenceEngine] = None
@@ -218,9 +210,11 @@ class PoolHandler(BaseHTTPRequestHandler):
                 log.error("tweet job failed: %s", e)
                 analysis = None
             results.append({"id": it.get("id"), "analysis": analysis})
-        # preserve input order
         by_id = {r["id"]: r for r in results}
-        ordered = [{"id": it.get("id"), "analysis": (by_id.get(it.get("id")) or {}).get("analysis")} for it in items]
+        ordered = [
+            {"id": it.get("id"), "analysis": (by_id.get(it.get("id")) or {}).get("analysis")}
+            for it in items
+        ]
         ms = int((time.time() - t0) * 1000)
         ok_n = sum(1 for r in ordered if r.get("analysis") is not None)
         log.info("tweets_batch n=%s ok=%s ms=%s", len(items), ok_n, ms)
@@ -261,7 +255,10 @@ class PoolHandler(BaseHTTPRequestHandler):
                 analysis = None
             results.append({"id": it.get("id"), "analysis": analysis})
         by_id = {r["id"]: r for r in results}
-        ordered = [{"id": it.get("id"), "analysis": (by_id.get(it.get("id")) or {}).get("analysis")} for it in items]
+        ordered = [
+            {"id": it.get("id"), "analysis": (by_id.get(it.get("id")) or {}).get("analysis")}
+            for it in items
+        ]
         ms = int((time.time() - t0) * 1000)
         ok_n = sum(1 for r in ordered if r.get("analysis") is not None)
         log.info("telegram_batch n=%s ok=%s ms=%s", len(items), ok_n, ms)
@@ -281,13 +278,11 @@ class PoolHandler(BaseHTTPRequestHandler):
         eng = get_engine()
         articles = body.get("articles") or []
         miner_hotkey = body.get("miner_hotkey")
-        triage_enabled = bool(body.get("triage_enabled"))
         t0 = time.time()
         futs = {}
         for art in articles:
             payload = dict(art)
             payload.setdefault("miner_hotkey", miner_hotkey)
-            payload.setdefault("triage_enabled", triage_enabled)
             futs[eng.submit(eng.analyze_article, payload)] = art
         results = []
         for fut in as_completed(futs):
@@ -300,7 +295,10 @@ class PoolHandler(BaseHTTPRequestHandler):
             results.append({"id": art.get("article_id"), "analysis": analysis})
         by_id = {r["id"]: r for r in results}
         ordered = [
-            {"id": a.get("article_id"), "analysis": (by_id.get(a.get("article_id")) or {}).get("analysis")}
+            {
+                "id": a.get("article_id"),
+                "analysis": (by_id.get(a.get("article_id")) or {}).get("analysis"),
+            }
             for a in articles
         ]
         ms = int((time.time() - t0) * 1000)

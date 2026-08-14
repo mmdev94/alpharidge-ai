@@ -57,14 +57,12 @@ class InferencePoolClient:
         articles: List[Dict[str, Any]],
         *,
         miner_hotkey: Optional[str] = None,
-        triage_enabled: bool = False,
     ) -> List[Dict[str, Any]]:
         r = self._client.post(
             "/v1/articles/batch",
             json={
                 "articles": articles,
                 "miner_hotkey": miner_hotkey,
-                "triage_enabled": triage_enabled,
             },
         )
         r.raise_for_status()
