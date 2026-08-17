@@ -32,7 +32,7 @@ log = logging.getLogger("inference_pool")
 class InferenceEngine:
     """Owns analyzers once; serves concurrent jobs via a thread pool."""
 
-    def __init__(self, workers: int = 4):
+    def __init__(self, workers: int = 10):
         self.workers = max(1, int(workers))
         self._executor = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="pool")
         log.info("loading analyzers workers=%s", self.workers)
@@ -332,7 +332,7 @@ def _quiet_third_party_loggers():
         logging.getLogger(name).setLevel(logging.ERROR)
 
 
-def run_server(host: str = "127.0.0.1", port: int = 30000, workers: int = 4):
+def run_server(host: str = "127.0.0.1", port: int = 30000, workers: int = 10):
     global _ENGINE
     logging.basicConfig(
         level=logging.INFO,

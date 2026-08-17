@@ -78,7 +78,7 @@ X_API_SOURCE = os.getenv("X_API_SOURCE", "x_api")
 INFERENCE_POOL_URL = os.getenv("INFERENCE_POOL_URL", "").rstrip("/")
 INFERENCE_POOL_HOST = os.getenv("INFERENCE_POOL_HOST", "127.0.0.1")
 INFERENCE_POOL_PORT = int(os.getenv("INFERENCE_POOL_PORT", "30000"))
-INFERENCE_POOL_WORKERS = int(os.getenv("INFERENCE_POOL_WORKERS", "4"))
+INFERENCE_POOL_WORKERS = int(os.getenv("INFERENCE_POOL_WORKERS", "10"))
 INFERENCE_POOL_TIMEOUT = float(os.getenv("INFERENCE_POOL_TIMEOUT", "600"))
 # Default pool URL when thin mode is requested via INFERENCE_POOL=1 but URL empty
 if not INFERENCE_POOL_URL and os.getenv("INFERENCE_POOL", "").strip().lower() in (

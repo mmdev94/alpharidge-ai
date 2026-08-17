@@ -5,7 +5,7 @@
 Env (optional):
   INFERENCE_POOL_HOST=127.0.0.1
   INFERENCE_POOL_PORT=30000
-  INFERENCE_POOL_WORKERS=4
+  INFERENCE_POOL_WORKERS=10
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from alpharidge_ai.inference_pool import run_server
 def main():
     host = os.getenv("INFERENCE_POOL_HOST", "127.0.0.1")
     port = int(os.getenv("INFERENCE_POOL_PORT", "30000"))
-    workers = int(os.getenv("INFERENCE_POOL_WORKERS", "4"))
+    workers = int(os.getenv("INFERENCE_POOL_WORKERS", "10"))
     run_server(host=host, port=port, workers=workers)
 
 
