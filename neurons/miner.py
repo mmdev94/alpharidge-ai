@@ -44,7 +44,7 @@ def _article_log(event: str, **fields) -> None:
     """Emit concise article lifecycle logs regardless of Bittensor log level."""
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     # Keep failure reasons first and always present for *failed* / *timeout* events.
-    if "failed" in event or "timeout" in event or "partial" in event or event.endswith("unavailable"):
+    if "failed" in event or "timeout" in event or event.endswith("unavailable"):
         reason = fields.pop("reason", None)
         fields = {"reason": _simple_reason(reason), **fields}
     details = " ".join(f"{key}={value}" for key, value in fields.items() if value is not None)
@@ -52,6 +52,61 @@ def _article_log(event: str, **fields) -> None:
     if details:
         line = f"{line} {details}"
     print(line, flush=True)
+
+
+def _fmt_step_s(value) -> str:
+    if value is None:
+        return "-"
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _summarize_solve_steps(payload: dict, count: int) -> str:
+    """Compact bottleneck summary from pool article-batch timings."""
+    steps = payload.get("steps") or []
+    if not steps:
+        for item in payload.get("results") or []:
+            timings = item.get("timings") or {}
+            if timings:
+                steps.append({"id": item.get("id"), **timings})
+    if not steps:
+        return "no_steps"
+    causes = {}
+    queue_vals, ner_vals, llm_vals = [], [], []
+    for row in steps:
+        cause = row.get("cause") or "unknown"
+        causes[cause] = causes.get(cause, 0) + 1
+        if row.get("queue") is not None:
+            queue_vals.append(float(row["queue"]))
+        if row.get("ner") is not None:
+            ner_vals.append(float(row["ner"]))
+        llm = float(row.get("llm1") or 0) + float(row.get("llm2") or 0)
+        if llm:
+            llm_vals.append(llm)
+    top_cause = max(causes.items(), key=lambda kv: kv[1])[0]
+    parts = [f"bottleneck={top_cause}"]
+    if queue_vals:
+        parts.append(f"queue_max={max(queue_vals):.1f}s")
+    if ner_vals:
+        parts.append(f"ner_max={max(ner_vals):.1f}s")
+    if llm_vals:
+        parts.append(f"llm_max={max(llm_vals):.1f}s")
+    parts.append("causes=" + ",".join(f"{k}:{v}" for k, v in sorted(causes.items())))
+    slow = sorted(
+        steps,
+        key=lambda r: float(r.get("total") or 0) + float(r.get("queue") or 0),
+        reverse=True,
+    )[:3]
+    if slow:
+        slow_txt = ";".join(
+            f"id={r.get('id')} q={_fmt_step_s(r.get('queue'))} ner={_fmt_step_s(r.get('ner'))} "
+            f"llm1={_fmt_step_s(r.get('llm1'))} llm2={_fmt_step_s(r.get('llm2'))} cause={r.get('cause')}"
+            for r in slow
+        )
+        parts.append(f"slowest[{slow_txt}]")
+    return " ".join(parts)
 
 
 def _quiet_thin_logging():
@@ -629,13 +684,38 @@ class Miner(BaseMinerNeuron):
                             "raw_html": getattr(article, "raw_html", None),
                         }
                     )
-                results = self.pool.analyze_articles_batch(
-                    articles,
-                    miner_hotkey=self.wallet.hotkey.ss58_address if self.wallet else None,
-                )
+                stop_wait = threading.Event()
+
+                def _wait_heartbeat():
+                    while not stop_wait.wait(30):
+                        elapsed = time.monotonic() - started_at
+                        _article_log(
+                            "solving",
+                            count=len(articles),
+                            seconds=f"{elapsed:.0f}",
+                            validator=validator_hotkey,
+                            stage="waiting_pool",
+                        )
+
+                waiter = threading.Thread(target=_wait_heartbeat, daemon=True)
+                waiter.start()
+                try:
+                    payload = self.pool.analyze_articles_batch(
+                        articles,
+                        miner_hotkey=self.wallet.hotkey.ss58_address if self.wallet else None,
+                    )
+                finally:
+                    stop_wait.set()
+                results = payload.get("results") or []
                 by_id = {r.get("id"): r.get("analysis") for r in results}
                 for article in synapse.article_batch:
                     self._apply_article_analysis(article, by_id.get(article.id))
+                _article_log(
+                    "solve_steps",
+                    count=len(articles),
+                    validator=validator_hotkey,
+                    detail=_summarize_solve_steps(payload, len(articles)),
+                )
             else:
                 for article in synapse.article_batch:
                     if not article.title:
@@ -775,7 +855,7 @@ class Miner(BaseMinerNeuron):
             if total and solved < total:
                 _article_log(
                     "solve_partial",
-                    reason=f"missing_analysis {total - solved}/{total}",
+                    missing=f"{total - solved}/{total}",
                     count=solved,
                     total=total,
                     validator=validator_hotkey,
@@ -802,6 +882,7 @@ class Miner(BaseMinerNeuron):
                 count=len(synapse.article_batch),
                 seconds=f"{time.monotonic() - started_at:.1f}",
                 validator=validator_hotkey,
+                hint="check alpha-pool article_step logs (queue=pool_busy ner=vps_busy llm1/llm2=llm_slow)",
             )
 
     async def forward_score(self, synapse: alpharidge_ai.protocol.Score) -> alpharidge_ai.protocol.Score:

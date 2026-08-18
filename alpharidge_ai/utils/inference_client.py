@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import httpx
 
@@ -57,7 +57,8 @@ class InferencePoolClient:
         articles: List[Dict[str, Any]],
         *,
         miner_hotkey: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
+        progress: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
         r = self._client.post(
             "/v1/articles/batch",
             json={
@@ -66,4 +67,12 @@ class InferencePoolClient:
             },
         )
         r.raise_for_status()
-        return r.json().get("results") or []
+        data = r.json() or {}
+        if progress is not None:
+            total = len(articles)
+            done = sum(
+                1 for item in (data.get("results") or []) if item.get("analysis") is not None
+            )
+            progress(done, total)
+        return data
+

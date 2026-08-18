@@ -83,14 +83,23 @@ class InferenceEngine:
         """Match neurons/miner.py 3.5.0 article path (mandatory triage)."""
         title = payload.get("title") or ""
         content = payload.get("content") or ""
+        t0 = time.monotonic()
+        timings: Dict[str, float] = {}
 
+        t_triage = time.monotonic()
         triage_rec, proof, _ = self.triage_stage.evaluate(title, content)
+        timings["triage"] = round(time.monotonic() - t_triage, 2)
 
         # Titleless / irrelevant → claim + proof only (keeps batch complete).
         if not title or triage_rec.get("label") == "irrelevant":
-            return triage_only_analysis_dict(triage_rec, proof)
+            timings["total"] = round(time.monotonic() - t0, 2)
+            timings["cause"] = "triage_only"
+            out = triage_only_analysis_dict(triage_rec, proof)
+            out["_timings"] = timings
+            return out
 
         # Relevant and borderline get full analysis; borderline is flagged after.
+        t_intel = time.monotonic()
         intel = self.article_intel.analyze(
             article_id=payload.get("article_id"),
             url=payload.get("url"),
@@ -102,10 +111,22 @@ class InferenceEngine:
             raw_html=payload.get("raw_html"),
             miner_hotkey=payload.get("miner_hotkey"),
         )
-        if intel is None:
-            return triage_only_analysis_dict(triage_rec, proof)
+        timings["intel"] = round(time.monotonic() - t_intel, 2)
+        extra = getattr(intel, "_solve_timings", None) if intel is not None else None
+        if isinstance(extra, dict):
+            timings.update(extra)
 
-        return intel_to_analysis_dict(intel, triage_rec=triage_rec, proof=proof)
+        if intel is None or getattr(intel, "_failed", False):
+            timings["total"] = round(time.monotonic() - t0, 2)
+            timings["cause"] = "intel_failed"
+            out = triage_only_analysis_dict(triage_rec, proof)
+            out["_timings"] = timings
+            return out
+
+        timings["total"] = round(time.monotonic() - t0, 2)
+        out = intel_to_analysis_dict(intel, triage_rec=triage_rec, proof=proof)
+        out["_timings"] = timings
+        return out
 
 
 _ENGINE: Optional[InferenceEngine] = None
@@ -138,6 +159,26 @@ def _read_json(handler: BaseHTTPRequestHandler) -> dict:
     if not raw:
         return {}
     return json.loads(raw.decode("utf-8"))
+
+
+def _classify_timeout_cause(timings: dict) -> str:
+    """Best-effort bottleneck label for one article."""
+    if timings.get("cause") in ("triage_only", "intel_failed"):
+        return timings["cause"]
+    queue_s = float(timings.get("queue") or 0.0)
+    ner_s = float(timings.get("ner") or 0.0)
+    llm_s = float(timings.get("llm1") or 0.0) + float(timings.get("llm2") or 0.0)
+    if queue_s >= 20 and queue_s >= max(ner_s, llm_s):
+        return "pool_busy"
+    if llm_s >= 20 and llm_s >= ner_s:
+        return "llm_slow"
+    if ner_s >= 8:
+        return "vps_busy"
+    if llm_s > 0:
+        return "llm"
+    if ner_s > 0:
+        return "ner"
+    return "unknown"
 
 
 class PoolHandler(BaseHTTPRequestHandler):
@@ -286,32 +327,93 @@ class PoolHandler(BaseHTTPRequestHandler):
         articles = body.get("articles") or []
         miner_hotkey = body.get("miner_hotkey")
         t0 = time.time()
+        queued = getattr(eng._executor, "_work_queue", None)
+        queue_depth = queued.qsize() if queued is not None else None
         futs = {}
         for art in articles:
             payload = dict(art)
             payload.setdefault("miner_hotkey", miner_hotkey)
-            futs[eng.submit(eng.analyze_article, payload)] = art
+            submitted_at = time.monotonic()
+            fut = eng.submit(eng.analyze_article, payload)
+            futs[fut] = (art, submitted_at)
         results = []
+        step_rows = []
         for fut in as_completed(futs):
-            art = futs[fut]
+            art, submitted_at = futs[fut]
+            wait_s = round(time.monotonic() - submitted_at, 1)
             try:
                 analysis = fut.result()
             except Exception as e:
                 log.error("article job id=%s failed: %s", art.get("article_id"), e)
                 analysis = None
-            results.append({"id": art.get("article_id"), "analysis": analysis})
+            timings = {}
+            if isinstance(analysis, dict):
+                timings = analysis.pop("_timings", None) or {}
+            run_s = float(timings.get("total") or 0.0)
+            queue_s = max(0.0, round(wait_s - run_s, 1))
+            timings["queue"] = queue_s
+            timings["wait"] = wait_s
+            cause = _classify_timeout_cause(timings)
+            timings["cause"] = cause
+            log.info(
+                "article_step id=%s queue=%.1fs triage=%ss ner=%ss llm1=%ss llm2=%ss assemble=%ss total=%ss cause=%s",
+                art.get("article_id"),
+                queue_s,
+                timings.get("triage"),
+                timings.get("ner"),
+                timings.get("llm1"),
+                timings.get("llm2"),
+                timings.get("assemble"),
+                timings.get("total") or wait_s,
+                cause,
+            )
+            step_rows.append(
+                {
+                    "id": art.get("article_id"),
+                    "queue": queue_s,
+                    "triage": timings.get("triage"),
+                    "ner": timings.get("ner"),
+                    "llm1": timings.get("llm1"),
+                    "llm2": timings.get("llm2"),
+                    "assemble": timings.get("assemble"),
+                    "total": timings.get("total") or wait_s,
+                    "cause": cause,
+                }
+            )
+            results.append({"id": art.get("article_id"), "analysis": analysis, "timings": timings})
         by_id = {r["id"]: r for r in results}
         ordered = [
             {
                 "id": a.get("article_id"),
                 "analysis": (by_id.get(a.get("article_id")) or {}).get("analysis"),
+                "timings": (by_id.get(a.get("article_id")) or {}).get("timings"),
             }
             for a in articles
         ]
         ms = int((time.time() - t0) * 1000)
         ok_n = sum(1 for r in ordered if r.get("analysis") is not None)
-        log.info("articles_batch n=%s ok=%s ms=%s", len(articles), ok_n, ms)
-        _json_response(self, 200, {"ok": True, "results": ordered, "ms": ms})
+        causes = {}
+        for row in step_rows:
+            causes[row["cause"]] = causes.get(row["cause"], 0) + 1
+        log.info(
+            "articles_batch n=%s ok=%s ms=%s queue=%s causes=%s",
+            len(articles),
+            ok_n,
+            ms,
+            queue_depth,
+            causes,
+        )
+        _json_response(
+            self,
+            200,
+            {
+                "ok": True,
+                "results": ordered,
+                "ms": ms,
+                "queue_depth": queue_depth,
+                "steps": step_rows,
+            },
+        )
 
 
 def _quiet_third_party_loggers():

@@ -491,6 +491,7 @@ class ArticleIntelligenceAnalyzer:
         raw_html: Optional[str] = None,
     ) -> Optional[ArticleIntelligence]:
         start_ms = int(time.time() * 1000)
+        timings: Dict[str, float] = {}
         body = content or summary or ""
         # Strip the disclosure/footer tail for the EXTRACTION path only (NER, assets,
         # LLM, sectors) so a "stocks mentioned" footer doesn't inject noise tickers.
@@ -503,6 +504,7 @@ class ArticleIntelligenceAnalyzer:
             # text_stats/content_hash stay on the plain `content` (Tier-2 gated
             # fields must not move). Only the NER/entity path consumes raw_html,
             # which lets the content extractor run trafilatura on real DOM.
+            t_ner = time.monotonic()
             text_stats = compute_text_stats(title, body)
             ner_result = self.ner_engine.extract_and_resolve(
                 title, body_truncated, raw_html=raw_html)
@@ -519,6 +521,7 @@ class ArticleIntelligenceAnalyzer:
             # Build NER hints for LLM Call 1
             ner_hints = self._format_ner_hints(ner_result)
             all_tickers = list({e.ticker for e in ner_result.resolved_assets if e.ticker})
+            timings["ner"] = round(time.monotonic() - t_ner, 2)
 
             # ── STAGE 2: LLM Call 1 — Extract & Classify (~8-12s) ──
             call1_prompt = (
@@ -527,7 +530,9 @@ class ArticleIntelligenceAnalyzer:
                 f"Article:\n\"\"\"{article_text}\"\"\"\n\n"
                 f"Pre-detected (NER):\n{ner_hints}"
             )
+            t_llm1 = time.monotonic()
             call1 = self._llm_call(call1_prompt, EXTRACT_CLASSIFY_TOOL, "extract_and_classify")
+            timings["llm1"] = round(time.monotonic() - t_llm1, 2)
 
             # Merge additional tickers from LLM
             for t in call1.get("additional_tickers", []):
@@ -542,7 +547,9 @@ class ArticleIntelligenceAnalyzer:
                 f"a one-liner, and a context paragraph.\n\n"
                 f"{fact_sheet}"
             )
+            t_llm2 = time.monotonic()
             call2 = self._llm_call(call2_prompt, REASON_SUMMARIZE_TOOL, "reason_and_summarize")
+            timings["llm2"] = round(time.monotonic() - t_llm2, 2)
 
             # ── ASSEMBLY ──
             # Contagion + per-asset sentiment are computed off-LLM from the DETERMINISTIC
@@ -578,6 +585,7 @@ class ArticleIntelligenceAnalyzer:
                 if sym != "OTHER":
                     primary_sector = {"id": sid, "symbol": sym}
             elapsed_ms = int(time.time() * 1000) - start_ms
+            t_asm = time.monotonic()
 
             # ── STAGE 4: Embeddings (~45ms) ──
             headline = (call2.get("headline") or title[:120])[:120]
@@ -656,20 +664,32 @@ class ArticleIntelligenceAnalyzer:
                 forward_event_description=call1.get("forward_event_description"),
                 inferred_impacts=inferred if inferred else None,
             )
-            bt.logging.info(f"[ARTICLE_INTEL] Done article {article_id} in {elapsed_ms}ms: "
-                           f"{len(assets)} assets, {len(entities)} entities")
+            timings["assemble"] = round(time.monotonic() - t_asm, 2)
+            timings["total"] = round(elapsed_ms / 1000.0, 2)
+            result._solve_timings = timings
+            bt.logging.info(
+                f"[ARTICLE_INTEL] Done article {article_id} in {elapsed_ms}ms: "
+                f"{len(assets)} assets, {len(entities)} entities "
+                f"ner={timings.get('ner')}s llm1={timings.get('llm1')}s "
+                f"llm2={timings.get('llm2')}s assemble={timings.get('assemble')}s"
+            )
             return result
 
         except Exception as e:
+            timings["total"] = round((int(time.time() * 1000) - start_ms) / 1000.0, 2)
             bt.logging.error(f"[ARTICLE_INTEL] Failed article {article_id}: {e}")
             bt.logging.error(f"[ARTICLE_INTEL] {traceback.format_exc()}")
-            return None
+            failed = type("FailedIntel", (), {})()
+            failed._solve_timings = timings
+            failed._failed = True
+            return failed
 
     # ========================================================================
     # LLM
     # ========================================================================
 
     def _llm_call(self, prompt: str, tool: dict, tool_name: str) -> dict:
+        t0 = time.monotonic()
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -685,9 +705,17 @@ class ArticleIntelligenceAnalyzer:
                 return {}
             parsed = json.loads(tc[0].function.arguments)
             # Models occasionally return a bare list/string instead of the tool schema object.
+            elapsed = time.monotonic() - t0
+            if elapsed >= 20:
+                bt.logging.warning(
+                    f"[ARTICLE_INTEL] {tool_name} slow {elapsed:.1f}s"
+                )
             return parsed if isinstance(parsed, dict) else {}
         except Exception as e:
-            bt.logging.warning(f"[ARTICLE_INTEL] {tool_name} failed: {e}")
+            elapsed = time.monotonic() - t0
+            bt.logging.warning(
+                f"[ARTICLE_INTEL] {tool_name} failed after {elapsed:.1f}s: {e}"
+            )
             return {}
 
     # ========================================================================
