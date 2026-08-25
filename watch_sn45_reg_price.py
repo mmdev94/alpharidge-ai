@@ -88,7 +88,8 @@ def main() -> int:
     p.add_argument("--netuid", type=int, default=DEFAULT_NETUID, help="Subnet netuid (default 45)")
     p.add_argument("--interval", type=float, default=60.0, help="Poll interval seconds (default 30)")
     p.add_argument("--once", action="store_true", help="Print once and exit")
-    args = p.parse_args()
+    args = p.parse_args().
+    
 
     print(
         f"Polling TaoMarketCap live snapshot netuid={args.netuid} every {args.interval}s  "
