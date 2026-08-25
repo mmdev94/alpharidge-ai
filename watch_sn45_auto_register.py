@@ -11,6 +11,9 @@ Usage (from repo root)::
     watch_sn45_auto_register.py --network finney
 
   .venv/bin/python watch_sn45_auto_register.py --once --dry-run
+
+Create ``~/.bittensor/password.txt`` (one line, coldkey password) before enabling
+live register. Override with ``--password-file`` if needed.
 """
 
 from __future__ import annotations
@@ -20,7 +23,6 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,8 +39,8 @@ DEFAULT_INTERVAL_S = 1200.0  # 20 minutes
 DEFAULT_COOLDOWN_S = 1200.0  # skip same miner for 20m after a failed register
 RAO_PER_TAO = 1_000_000_000
 
-# Both coldkeys use this password (written to a temp --wallet-password-file).
-WALLET_PASSWORD = "12341234"
+# Coldkey password file for btcli --wallet-password-file (create this yourself).
+DEFAULT_PASSWORD_FILE = str(Path.home() / ".bittensor" / "password.txt")
 
 # (pm2_name, wallet_name, hotkey_name)
 DEFAULT_MINERS: list[tuple[str, str, str]] = [
@@ -208,6 +210,7 @@ def btcli_register(
     netuid: int,
     network: str,
     wallet_path: Optional[str],
+    password_file: str,
     dry_run: bool,
 ) -> bool:
     """Register via ``btcli subnet register`` + password file (non-interactive)."""
@@ -224,24 +227,25 @@ def btcli_register(
         "--network",
         network,
         "--yes",
+        "--wallet-password-file",
+        password_file,
     ]
     if wallet_path:
         cmd.extend(["--wallet-path", wallet_path])
 
     if dry_run:
-        log(f"DRY   would run: {' '.join(cmd)} --wallet-password-file <tmp>")
+        log(f"DRY   would run: {' '.join(cmd)}")
         return True
 
-    pw_path: Optional[str] = None
-    try:
-        fd, pw_path = tempfile.mkstemp(prefix="btcli-pw-", suffix=".txt")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(WALLET_PASSWORD)
-            f.write("\n")
-        os.chmod(pw_path, 0o600)
-        cmd.extend(["--wallet-password-file", pw_path])
+    if not Path(password_file).is_file():
+        log(
+            f"ERROR password file missing: {password_file} "
+            f"(create it with your coldkey password on one line)"
+        )
+        return False
 
-        log(f"INFO  running: {' '.join(cmd[:-1])} <password-file>")
+    try:
+        log(f"INFO  running: {' '.join(cmd)}")
         r = subprocess.run(
             cmd,
             capture_output=True,
@@ -250,7 +254,6 @@ def btcli_register(
         )
         out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
         if out:
-            # Keep logs readable but useful.
             for line in out.splitlines()[-40:]:
                 log(f"btcli {line}")
         if r.returncode != 0:
@@ -267,12 +270,6 @@ def btcli_register(
             f"{type(e).__name__}: {e}"
         )
         return False
-    finally:
-        if pw_path:
-            try:
-                os.unlink(pw_path)
-            except OSError:
-                pass
 
 
 def wait_registered(
@@ -297,6 +294,7 @@ def try_reregister(
     netuid: int,
     network: str,
     wallet_path: Optional[str],
+    password_file: str,
     btcli: str,
     dry_run: bool,
     cooldown_until: dict[str, float],
@@ -336,6 +334,7 @@ def try_reregister(
         netuid=netuid,
         network=network,
         wallet_path=wallet_path,
+        password_file=password_file,
         dry_run=dry_run,
     ):
         cooldown_until[key] = now + cooldown_s
@@ -366,6 +365,7 @@ def run_cycle(
     netuid: int,
     network: str,
     wallet_path: Optional[str],
+    password_file: str,
     btcli: str,
     dry_run: bool,
     cooldown_until: dict[str, float],
@@ -432,6 +432,7 @@ def run_cycle(
         netuid=netuid,
         network=network,
         wallet_path=wallet_path,
+        password_file=password_file,
         btcli=btcli,
         dry_run=dry_run,
         cooldown_until=cooldown_until,
@@ -463,6 +464,11 @@ def main() -> int:
     )
     p.add_argument("--wallet.path", dest="wallet_path", default=None)
     p.add_argument(
+        "--password-file",
+        default=DEFAULT_PASSWORD_FILE,
+        help=f"Coldkey password file for btcli (default: {DEFAULT_PASSWORD_FILE})",
+    )
+    p.add_argument(
         "--btcli",
         default=None,
         help="Path to btcli (default: .venv/bin/btcli or PATH)",
@@ -484,11 +490,13 @@ def main() -> int:
 
     miners = load_miners(args.config)
     btcli = resolve_btcli(args.btcli)
+    password_file = os.path.expanduser(args.password_file)
     log(
         f"Starting SN45 auto-register watchdog  netuid={args.netuid}  "
         f"network={args.network}  miners={len(miners)}  "
         f"interval={args.interval}s  max_register_per_cycle=1  "
-        f"btcli={btcli}  dry_run={args.dry_run}"
+        f"btcli={btcli}  password_file={password_file}  "
+        f"dry_run={args.dry_run}"
     )
 
     cooldown_until: dict[str, float] = {}
@@ -510,6 +518,7 @@ def main() -> int:
                 netuid=args.netuid,
                 network=args.network,
                 wallet_path=args.wallet_path,
+                password_file=password_file,
                 btcli=btcli,
                 dry_run=args.dry_run,
                 cooldown_until=cooldown_until,
