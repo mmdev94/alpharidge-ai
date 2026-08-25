@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Watch SN45 miner hotkeys; auto burned-register + pm2 restart on deregistration.
+"""Watch SN45 miner hotkeys; auto-register via btcli + pm2 restart on deregistration.
 
-Polls the chain every 10 minutes. Checks all miners; if any are deregistered,
-re-registers **at most one** per cycle, then ``pm2 restart`` that miner.
+Polls the chain every 20 minutes. Checks all miners; if any are deregistered,
+re-registers **at most one** per cycle with ``btcli subnet register``, then
+``pm2 restart`` that miner.
 
 Usage (from repo root)::
 
@@ -17,7 +18,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,11 +33,11 @@ from typing import Any, Optional
 
 DEFAULT_NETUID = 45
 DEFAULT_NETWORK = "finney"
-DEFAULT_INTERVAL_S = 600.0  # 10 minutes
-DEFAULT_COOLDOWN_S = 600.0  # skip same miner for 10m after a failed register
+DEFAULT_INTERVAL_S = 1200.0  # 20 minutes
+DEFAULT_COOLDOWN_S = 1200.0  # skip same miner for 20m after a failed register
 RAO_PER_TAO = 1_000_000_000
 
-# Both coldkeys use this password.
+# Both coldkeys use this password (written to a temp --wallet-password-file).
 WALLET_PASSWORD = "12341234"
 
 # (pm2_name, wallet_name, hotkey_name)
@@ -118,51 +121,27 @@ def load_miners(config_path: Optional[str]) -> list[MinerSpec]:
     return out
 
 
+def resolve_btcli(explicit: Optional[str] = None) -> str:
+    if explicit:
+        return explicit
+    env = os.environ.get("BTCLI")
+    if env:
+        return env
+    here = Path(__file__).resolve().parent
+    venv_btcli = here / ".venv" / "bin" / "btcli"
+    if venv_btcli.is_file():
+        return str(venv_btcli)
+    found = shutil.which("btcli")
+    if found:
+        return found
+    return "btcli"
+
+
 def make_wallet(bt: Any, name: str, hotkey: str, path: Optional[str]) -> Any:
     kwargs: dict[str, Any] = {"name": name, "hotkey": hotkey}
     if path:
         kwargs["path"] = path
     return bt.Wallet(**kwargs)
-
-
-def unlock_coldkey(wallet: Any) -> bool:
-    """Unlock coldkey with hardcoded password (non-interactive for PM2).
-
-    Bittensor 11.x: ``Wallet.unlock_coldkey()`` takes no password args; decrypt
-    via ``coldkey_file.get_keypair(password=...)`` and cache on the wallet.
-    """
-    pw = WALLET_PASSWORD
-    try:
-        kf = getattr(wallet, "coldkey_file", None) or getattr(
-            wallet, "_coldkey_file", None
-        )
-        if kf is not None and hasattr(kf, "get_keypair"):
-            kp = kf.get_keypair(password=pw)
-            wallet._coldkey = kp
-            return True
-
-        # Older / alternate APIs
-        unlock = getattr(wallet, "unlock_coldkey", None)
-        if callable(unlock):
-            try:
-                unlock(pw)  # positional password (some versions)
-            except TypeError:
-                unlock()  # no-arg (bt 11+) — needs env/cached key
-            return True
-
-        if kf is not None and hasattr(kf, "decrypt"):
-            kf.decrypt(pw)
-            return True
-
-        os.environ["BT_WALLET_PASSWORD"] = pw
-        _ = wallet.coldkey
-        return True
-    except Exception as e:
-        log(
-            f"ERROR unlock coldkey {getattr(wallet, 'name', '?')}: "
-            f"{type(e).__name__}: {e}"
-        )
-        return False
 
 
 def is_registered(sub: Any, netuid: int, hotkey_ss58: str) -> bool:
@@ -222,35 +201,78 @@ def pm2_restart(name: str, dry_run: bool) -> bool:
         return False
 
 
-def _wallet_label(wallet: Any, hotkey_name: str) -> str:
-    name = getattr(wallet, "name", "?")
-    return f"{name}/{hotkey_name}"
-
-
-def burned_register(
-    sub: Any, wallet: Any, netuid: int, hotkey_name: str, dry_run: bool
+def btcli_register(
+    *,
+    btcli: str,
+    miner: MinerSpec,
+    netuid: int,
+    network: str,
+    wallet_path: Optional[str],
+    dry_run: bool,
 ) -> bool:
-    label = _wallet_label(wallet, hotkey_name)
+    """Register via ``btcli subnet register`` + password file (non-interactive)."""
+    cmd = [
+        btcli,
+        "subnet",
+        "register",
+        "--netuid",
+        str(netuid),
+        "--wallet",
+        miner.wallet,
+        "--wallet-hotkey",
+        miner.hotkey,
+        "--network",
+        network,
+        "--yes",
+    ]
+    if wallet_path:
+        cmd.extend(["--wallet-path", wallet_path])
+
     if dry_run:
-        log(f"DRY   would burned_register wallet={label} netuid={netuid}")
+        log(f"DRY   would run: {' '.join(cmd)} --wallet-password-file <tmp>")
         return True
-    if not unlock_coldkey(wallet):
-        return False
+
+    pw_path: Optional[str] = None
     try:
-        ok = sub.burned_register(
-            wallet=wallet,
-            netuid=netuid,
-            wait_for_inclusion=True,
-            wait_for_finalization=False,
+        fd, pw_path = tempfile.mkstemp(prefix="btcli-pw-", suffix=".txt")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(WALLET_PASSWORD)
+            f.write("\n")
+        os.chmod(pw_path, 0o600)
+        cmd.extend(["--wallet-password-file", pw_path])
+
+        log(f"INFO  running: {' '.join(cmd[:-1])} <password-file>")
+        r = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,
         )
-        if ok is False:
-            log(f"ERROR burned_register returned False for {label}")
+        out = ((r.stdout or "") + "\n" + (r.stderr or "")).strip()
+        if out:
+            # Keep logs readable but useful.
+            for line in out.splitlines()[-40:]:
+                log(f"btcli {line}")
+        if r.returncode != 0:
+            log(
+                f"ERROR btcli register {miner.wallet}/{miner.hotkey} "
+                f"rc={r.returncode}"
+            )
             return False
-        log(f"OK    burned_register submitted for {label}")
+        log(f"OK    btcli register {miner.wallet}/{miner.hotkey}")
         return True
     except Exception as e:
-        log(f"ERROR burned_register {label}: {type(e).__name__}: {e}")
+        log(
+            f"ERROR btcli register {miner.wallet}/{miner.hotkey}: "
+            f"{type(e).__name__}: {e}"
+        )
         return False
+    finally:
+        if pw_path:
+            try:
+                os.unlink(pw_path)
+            except OSError:
+                pass
 
 
 def wait_registered(
@@ -273,7 +295,9 @@ def try_reregister(
     sub: Any,
     miner: MinerSpec,
     netuid: int,
+    network: str,
     wallet_path: Optional[str],
+    btcli: str,
     dry_run: bool,
     cooldown_until: dict[str, float],
     cooldown_s: float,
@@ -302,12 +326,17 @@ def try_reregister(
             f"balance={bal:.6f} τ < cost≈{cost:.6f} τ — will retry later"
         )
         cooldown_until[key] = now + cooldown_s
-        return True  # counted as this cycle's attempt slot
+        return True
     if cost is not None:
         log(f"INFO  {miner.pm2} reg_cost≈{cost:.6f} τ balance={bal}")
 
-    if not burned_register(
-        sub, wallet, netuid, miner.hotkey, dry_run=dry_run
+    if not btcli_register(
+        btcli=btcli,
+        miner=miner,
+        netuid=netuid,
+        network=network,
+        wallet_path=wallet_path,
+        dry_run=dry_run,
     ):
         cooldown_until[key] = now + cooldown_s
         return True
@@ -335,13 +364,18 @@ def run_cycle(
     sub: Any,
     miners: list[MinerSpec],
     netuid: int,
+    network: str,
     wallet_path: Optional[str],
+    btcli: str,
     dry_run: bool,
     cooldown_until: dict[str, float],
     cooldown_s: float,
 ) -> None:
     """Check all miners; re-register at most ONE deregistered miner this cycle."""
-    log(f"--- cycle start: checking {len(miners)} miners on netuid={netuid} ---")
+    log(
+        f"--- cycle start: checking {len(miners)} miners on netuid={netuid} "
+        f"(max 1 register / cycle) ---"
+    )
 
     deregistered: list[MinerSpec] = []
     ok_count = 0
@@ -380,7 +414,7 @@ def run_cycle(
         log("--- cycle done (nothing to register) ---")
         return
 
-    # Only one register per 10-minute cycle.
+    # Only one register per cycle (default every 20 minutes).
     target = deregistered[0]
     waiting = [m.pm2 for m in deregistered[1:]]
     if waiting:
@@ -396,7 +430,9 @@ def run_cycle(
         sub=sub,
         miner=target,
         netuid=netuid,
+        network=network,
         wallet_path=wallet_path,
+        btcli=btcli,
         dry_run=dry_run,
         cooldown_until=cooldown_until,
         cooldown_s=cooldown_s,
@@ -408,7 +444,7 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=(
             "SN45 auto-register watchdog "
-            "(check all → burned_register at most 1 per 10m → pm2 restart)"
+            "(check all → btcli subnet register at most 1 per 20m → pm2 restart)"
         )
     )
     p.add_argument("--netuid", type=int, default=DEFAULT_NETUID)
@@ -417,7 +453,7 @@ def main() -> int:
         "--interval",
         type=float,
         default=DEFAULT_INTERVAL_S,
-        help="Seconds between checks (default 600 = 10 min)",
+        help="Seconds between checks (default 1200 = 20 min)",
     )
     p.add_argument(
         "--cooldown",
@@ -426,6 +462,11 @@ def main() -> int:
         help="Seconds to wait after a failed register before retrying that miner",
     )
     p.add_argument("--wallet.path", dest="wallet_path", default=None)
+    p.add_argument(
+        "--btcli",
+        default=None,
+        help="Path to btcli (default: .venv/bin/btcli or PATH)",
+    )
     p.add_argument(
         "--config",
         default=None,
@@ -442,11 +483,12 @@ def main() -> int:
     import bittensor as bt
 
     miners = load_miners(args.config)
+    btcli = resolve_btcli(args.btcli)
     log(
         f"Starting SN45 auto-register watchdog  netuid={args.netuid}  "
         f"network={args.network}  miners={len(miners)}  "
         f"interval={args.interval}s  max_register_per_cycle=1  "
-        f"dry_run={args.dry_run}"
+        f"btcli={btcli}  dry_run={args.dry_run}"
     )
 
     cooldown_until: dict[str, float] = {}
@@ -466,7 +508,9 @@ def main() -> int:
                 sub=sub,
                 miners=miners,
                 netuid=args.netuid,
+                network=args.network,
                 wallet_path=args.wallet_path,
+                btcli=btcli,
                 dry_run=args.dry_run,
                 cooldown_until=cooldown_until,
                 cooldown_s=args.cooldown,
