@@ -207,13 +207,15 @@ def btcli_register(
     *,
     btcli: str,
     miner: MinerSpec,
+    hotkey_ss58: str,
     netuid: int,
     network: str,
     wallet_path: Optional[str],
     password_file: str,
     dry_run: bool,
 ) -> bool:
-    """Register via ``btcli subnet register`` + password file (non-interactive)."""
+    """Register via ``btcli subnet register`` (btcli 11.x needs explicit --hotkey)."""
+    # btcli 11: --hotkey must be SS58 (or WALLET/HOTKEY); wallet-hotkey alone is not enough.
     cmd = [
         btcli,
         "subnet",
@@ -224,6 +226,8 @@ def btcli_register(
         miner.wallet,
         "--wallet-hotkey",
         miner.hotkey,
+        "--hotkey",
+        hotkey_ss58,
         "--network",
         network,
         "--yes",
@@ -331,6 +335,7 @@ def try_reregister(
     if not btcli_register(
         btcli=btcli,
         miner=miner,
+        hotkey_ss58=hotkey_ss58,
         netuid=netuid,
         network=network,
         wallet_path=wallet_path,
