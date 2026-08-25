@@ -126,15 +126,34 @@ def make_wallet(bt: Any, name: str, hotkey: str, path: Optional[str]) -> Any:
 
 
 def unlock_coldkey(wallet: Any) -> bool:
-    """Unlock coldkey with hardcoded password (non-interactive for PM2)."""
+    """Unlock coldkey with hardcoded password (non-interactive for PM2).
+
+    Bittensor 11.x: ``Wallet.unlock_coldkey()`` takes no password args; decrypt
+    via ``coldkey_file.get_keypair(password=...)`` and cache on the wallet.
+    """
     pw = WALLET_PASSWORD
     try:
-        if hasattr(wallet, "unlock_coldkey"):
-            wallet.unlock_coldkey(password=pw)
+        kf = getattr(wallet, "coldkey_file", None) or getattr(
+            wallet, "_coldkey_file", None
+        )
+        if kf is not None and hasattr(kf, "get_keypair"):
+            kp = kf.get_keypair(password=pw)
+            wallet._coldkey = kp
             return True
-        if hasattr(wallet, "coldkey_file"):
-            wallet.coldkey_file.decrypt(pw)
+
+        # Older / alternate APIs
+        unlock = getattr(wallet, "unlock_coldkey", None)
+        if callable(unlock):
+            try:
+                unlock(pw)  # positional password (some versions)
+            except TypeError:
+                unlock()  # no-arg (bt 11+) — needs env/cached key
             return True
+
+        if kf is not None and hasattr(kf, "decrypt"):
+            kf.decrypt(pw)
+            return True
+
         os.environ["BT_WALLET_PASSWORD"] = pw
         _ = wallet.coldkey
         return True
