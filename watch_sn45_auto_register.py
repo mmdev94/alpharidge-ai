@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Watch SN45 miner hotkeys; auto-register via btcli + pm2 restart on deregistration.
 
-Polls the chain every 20 minutes. Checks all miners; if any are deregistered,
+Polls the chain every 1 hour. Checks all miners; if any are deregistered,
 re-registers **at most one** per cycle with ``btcli subnet register``, then
 ``pm2 restart`` that miner.
 
@@ -35,8 +35,8 @@ from typing import Any, Optional
 
 DEFAULT_NETUID = 45
 DEFAULT_NETWORK = "finney"
-DEFAULT_INTERVAL_S = 1200.0  # 20 minutes
-DEFAULT_COOLDOWN_S = 1200.0  # skip same miner for 20m after a failed register
+DEFAULT_INTERVAL_S = 3600.0  # 1 hour
+DEFAULT_COOLDOWN_S = 3600.0  # skip same miner for 1h after a failed register
 RAO_PER_TAO = 1_000_000_000
 
 # Coldkey password file for btcli --wallet-password-file (create this yourself).
@@ -419,7 +419,7 @@ def run_cycle(
         log("--- cycle done (nothing to register) ---")
         return
 
-    # Only one register per cycle (default every 20 minutes).
+    # Only one register per cycle (default every 1 hour).
     target = deregistered[0]
     waiting = [m.pm2 for m in deregistered[1:]]
     if waiting:
@@ -450,7 +450,7 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=(
             "SN45 auto-register watchdog "
-            "(check all → btcli subnet register at most 1 per 20m → pm2 restart)"
+            "(check all → btcli subnet register at most 1 per 1h → pm2 restart)"
         )
     )
     p.add_argument("--netuid", type=int, default=DEFAULT_NETUID)
@@ -459,7 +459,7 @@ def main() -> int:
         "--interval",
         type=float,
         default=DEFAULT_INTERVAL_S,
-        help="Seconds between checks (default 1200 = 20 min)",
+        help="Seconds between checks (default 3600 = 1 hour)",
     )
     p.add_argument(
         "--cooldown",
