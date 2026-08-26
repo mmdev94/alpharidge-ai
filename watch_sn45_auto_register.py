@@ -5,6 +5,9 @@ Polls the chain every 1 hour. Checks all miners; if any are deregistered,
 re-registers **at most one** per cycle with ``btcli subnet register``, then
 ``pm2 restart`` that miner.
 
+Also restarts ``alpha-pool`` once per day at **00:00 UTC** (pool-only; miners
+stay up so IsAlive keeps working).
+
 Usage (from repo root)::
 
   pm2 start .venv/bin/python --name alpha-reg-watch -- \\
@@ -25,7 +28,7 @@ import shutil
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -41,6 +44,10 @@ RAO_PER_TAO = 1_000_000_000
 
 # Coldkey password file for btcli --wallet-password-file (create this yourself).
 DEFAULT_PASSWORD_FILE = str(Path.home() / ".bittensor" / "password.txt")
+
+# Daily pool restart at 00:00 UTC (memory reclaim; miners stay running).
+DEFAULT_POOL_PM2 = "alpha-pool"
+POOL_RESTART_POLL_S = 30.0
 
 # (pm2_name, wallet_name, hotkey_name)
 DEFAULT_MINERS: list[tuple[str, str, str]] = [
@@ -201,6 +208,52 @@ def pm2_restart(name: str, dry_run: bool) -> bool:
     except Exception as e:
         log(f"ERROR pm2 restart {name}: {type(e).__name__}: {e}")
         return False
+
+
+def utc_today() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def maybe_restart_pool_daily(
+    *,
+    pool_pm2: Optional[str],
+    last_restart_date: date,
+    dry_run: bool,
+) -> date:
+    """Restart pool once when UTC date rolls over (≈00:00 UTC). Returns updated date."""
+    if not pool_pm2:
+        return last_restart_date
+    today = utc_today()
+    if today <= last_restart_date:
+        return last_restart_date
+    log(
+        f"ACTION daily {pool_pm2} restart (UTC date {last_restart_date} → {today})"
+    )
+    pm2_restart(pool_pm2, dry_run=dry_run)
+    return today
+
+
+def sleep_between_cycles(
+    interval_s: float,
+    *,
+    pool_pm2: Optional[str],
+    last_pool_restart_date: date,
+    dry_run: bool,
+) -> date:
+    """Sleep ``interval_s``, polling near 00:00 UTC for daily pool restart."""
+    deadline = time.time() + max(5.0, interval_s)
+    last = last_pool_restart_date
+    while True:
+        last = maybe_restart_pool_daily(
+            pool_pm2=pool_pm2,
+            last_restart_date=last,
+            dry_run=dry_run,
+        )
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        time.sleep(min(POOL_RESTART_POLL_S, left))
+    return last
 
 
 def btcli_register(
@@ -450,7 +503,8 @@ def main() -> int:
     p = argparse.ArgumentParser(
         description=(
             "SN45 auto-register watchdog "
-            "(check all → btcli subnet register at most 1 per 1h → pm2 restart)"
+            "(hourly check → btcli register at most 1 → pm2 restart miner; "
+            "daily 00:00 UTC alpha-pool restart)"
         )
     )
     p.add_argument("--netuid", type=int, default=DEFAULT_NETUID)
@@ -479,6 +533,16 @@ def main() -> int:
         help="Path to btcli (default: .venv/bin/btcli or PATH)",
     )
     p.add_argument(
+        "--pool-pm2",
+        default=DEFAULT_POOL_PM2,
+        help=f"PM2 process to restart daily at 00:00 UTC (default: {DEFAULT_POOL_PM2})",
+    )
+    p.add_argument(
+        "--no-pool-restart",
+        action="store_true",
+        help="Disable daily alpha-pool restart",
+    )
+    p.add_argument(
         "--config",
         default=None,
         help='Optional JSON with {"miners":[{"pm2","wallet","hotkey"},...]}',
@@ -496,11 +560,15 @@ def main() -> int:
     miners = load_miners(args.config)
     btcli = resolve_btcli(args.btcli)
     password_file = os.path.expanduser(args.password_file)
+    pool_pm2 = None if args.no_pool_restart else args.pool_pm2
+    # Skip restart on boot; only fire after the next UTC midnight.
+    last_pool_restart_date = utc_today()
     log(
         f"Starting SN45 auto-register watchdog  netuid={args.netuid}  "
         f"network={args.network}  miners={len(miners)}  "
         f"interval={args.interval}s  max_register_per_cycle=1  "
         f"btcli={btcli}  password_file={password_file}  "
+        f"daily_pool_restart={pool_pm2 or 'off'}@00:00UTC  "
         f"dry_run={args.dry_run}"
     )
 
@@ -514,7 +582,12 @@ def main() -> int:
                 log(f"WARN  subtensor connect: {type(e).__name__}: {e}")
                 if args.once:
                     return 1
-                time.sleep(max(5.0, args.interval))
+                last_pool_restart_date = sleep_between_cycles(
+                    args.interval,
+                    pool_pm2=pool_pm2,
+                    last_pool_restart_date=last_pool_restart_date,
+                    dry_run=args.dry_run,
+                )
                 continue
             run_cycle(
                 bt=bt,
@@ -533,7 +606,12 @@ def main() -> int:
             log(f"ERROR cycle: {type(e).__name__}: {e}")
         if args.once:
             return 0
-        time.sleep(max(5.0, args.interval))
+        last_pool_restart_date = sleep_between_cycles(
+            args.interval,
+            pool_pm2=pool_pm2,
+            last_pool_restart_date=last_pool_restart_date,
+            dry_run=args.dry_run,
+        )
 
 
 if __name__ == "__main__":
