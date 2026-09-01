@@ -1,6 +1,7 @@
 """
 Centralized configuration loader for alpharidge_ai_subnet.
-Loads environment variables from .miner_env and .vali_env files.
+Loads environment variables from .miner_env (miners) and optionally .vali_env
+(validators only — miners do not need .vali_env).
 
 This module should be imported at the top of any module that needs configuration:
     from alpharidge_ai import config
@@ -22,27 +23,40 @@ _SUBNET_ROOT = Path(__file__).resolve().parent.parent
 _MINER_ENV_PATH = _SUBNET_ROOT / ".miner_env"
 _VALI_ENV_PATH = _SUBNET_ROOT / ".vali_env"
 
-# Load environment files
-try:
-    from dotenv import load_dotenv
-    
-    # Load miner env file (if it exists)
+# Load environment files (once per process; miners use .miner_env only)
+_ENV_BOOTSTRAPPED = False
+
+
+def _bootstrap_env_files() -> None:
+    global _ENV_BOOTSTRAPPED
+    if _ENV_BOOTSTRAPPED:
+        return
+    _ENV_BOOTSTRAPPED = True
+
+    verbose = os.getenv("CONFIG_VERBOSE", "").strip().lower() in ("1", "true", "yes")
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        if verbose:
+            print("[CONFIG] python-dotenv not installed; using system environment only")
+        return
+
     if _MINER_ENV_PATH.exists():
         load_dotenv(str(_MINER_ENV_PATH), override=True)
-        print(f"[CONFIG] Loaded {_MINER_ENV_PATH}")
-    else:
+        if verbose:
+            print(f"[CONFIG] Loaded {_MINER_ENV_PATH}")
+    elif verbose:
         print(f"[CONFIG] Warning: {_MINER_ENV_PATH} not found")
-    
-    # Load validator env file (if it exists)
-    # Note: validator vars will override miner vars if both exist
+
+    # Validators may use .vali_env; miners do not need it — load silently if present.
     if _VALI_ENV_PATH.exists():
         load_dotenv(str(_VALI_ENV_PATH), override=True)
-        print(f"[CONFIG] Loaded {_VALI_ENV_PATH}")
-    else:
-        print(f"[CONFIG] Warning: {_VALI_ENV_PATH} not found")
-        
-except ImportError:
-    print("[CONFIG] Warning: python-dotenv not installed, using system environment variables only")
+        if verbose:
+            print(f"[CONFIG] Loaded {_VALI_ENV_PATH}")
+
+
+_bootstrap_env_files()
 
 
 # ============================================================================
