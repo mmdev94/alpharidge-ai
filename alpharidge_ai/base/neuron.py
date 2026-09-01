@@ -99,16 +99,18 @@ class BaseNeuron(ABC):
         bt.logging.info(f"Subtensor: {self.subtensor}")
         bt.logging.info(f"Metagraph: {self.metagraph}")
 
-        # Check if the miner is registered on the Bittensor network before proceeding further.
-        self.check_registered()
+        self.is_subnet_registered: bool = False
+        self.uid: typing.Optional[int] = None
+        self.refresh_registration()
 
-        # Each miner gets a unique identity (UID) in the network for differentiation.
-        self.uid = self.metagraph.hotkeys.index(
-            self.wallet.hotkey.ss58_address
-        )
-        bt.logging.info(
-            f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}"
-        )
+        if self.is_subnet_registered:
+            bt.logging.info(
+                f"Running neuron on subnet: {self.config.netuid} with uid {self.uid} using network: {self.subtensor.chain_endpoint}"
+            )
+        else:
+            bt.logging.warning(
+                f"Hotkey not registered on netuid {self.config.netuid}; idle until registered."
+            )
         self.step = 0
 
     @abstractmethod
@@ -123,8 +125,8 @@ class BaseNeuron(ABC):
         """
         Wrapper for synchronizing the state of the network for the given miner or validator.
         """
-        # Ensure miner or validator hotkey is still registered on the network.
-        self.check_registered()
+        if not self.refresh_registration():
+            return
 
         if self.should_sync_metagraph():
             self.resync_metagraph()
@@ -135,22 +137,42 @@ class BaseNeuron(ABC):
         # Always save state.
         self.save_state()
 
-    def check_registered(self):
-        # --- Check for registration.
-        if not self.subtensor.is_hotkey_registered(
-            netuid=self.config.netuid,
-            hotkey_ss58=self.wallet.hotkey.ss58_address,
-        ):
-            bt.logging.error(
-                f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
-                f" Please register the hotkey using `btcli subnets register` before trying again"
+    def refresh_registration(self) -> bool:
+        """Update ``is_subnet_registered`` / ``uid`` from chain. Returns current state."""
+        try:
+            registered = self.subtensor.is_hotkey_registered(
+                netuid=self.config.netuid,
+                hotkey_ss58=self.wallet.hotkey.ss58_address,
             )
-            exit()
+        except Exception as e:
+            bt.logging.debug(f"registration probe failed: {e}")
+            return self.is_subnet_registered
+
+        self.is_subnet_registered = bool(registered)
+        if self.is_subnet_registered:
+            try:
+                self.uid = int(
+                    self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+                )
+            except ValueError:
+                self.metagraph.sync(subtensor=self.subtensor)
+                self.uid = int(
+                    self.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
+                )
+        else:
+            self.uid = None
+        return self.is_subnet_registered
+
+    def check_registered(self) -> bool:
+        """Legacy name; returns registration state without exiting."""
+        return self.refresh_registration()
 
     def should_sync_metagraph(self):
         """
         Check if enough epoch blocks have elapsed since the last checkpoint to sync.
         """
+        if self.uid is None:
+            return False
         return (
             self.block - self.metagraph.last_update[self.uid]
         ) > self.config.neuron.epoch_length
@@ -158,6 +180,9 @@ class BaseNeuron(ABC):
     def should_set_weights(self) -> bool:
         # Don't set weights on initialization.
         if self.step == 0:
+            return False
+
+        if self.uid is None:
             return False
 
         # Check if enough epoch blocks have elapsed since the last epoch.

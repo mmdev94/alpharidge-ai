@@ -29,6 +29,10 @@ from alpharidge_ai.utils.config import add_miner_args
 from typing import Union
 
 
+# When deregistered: long sleep between chain probes (minimal CPU / RPC).
+DEREGISTERED_IDLE_POLL_S = 600.0
+
+
 class BaseMinerNeuron(BaseNeuron):
     """
     Base class for Bittensor miners.
@@ -98,6 +102,58 @@ class BaseMinerNeuron(BaseNeuron):
         self.is_running: bool = False
         self.thread: Union[threading.Thread, None] = None
         self.lock = asyncio.Lock()
+        self._axon_started: bool = False
+        self._idle_notice_sent: bool = False
+
+    def _on_subnet_deregistered(self) -> None:
+        """Hook when hotkey leaves the metagraph (subclasses may log once)."""
+        if not self._idle_notice_sent:
+            bt.logging.warning(
+                f"Hotkey deregistered on netuid {self.config.netuid}; "
+                f"axon stopped — idle until re-registered."
+            )
+            self._idle_notice_sent = True
+
+    def _on_subnet_registered(self) -> None:
+        """Hook when hotkey returns to the metagraph."""
+        self._idle_notice_sent = False
+        bt.logging.info(
+            f"Hotkey registered on netuid {self.config.netuid} uid={self.uid}; resuming axon."
+        )
+
+    def _start_axon(self) -> None:
+        if self._axon_started:
+            return
+        self.sync()
+        if not self.is_subnet_registered or self.uid is None:
+            return
+        bt.logging.info(
+            f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
+        )
+        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+        self.axon.start()
+        self._axon_started = True
+        bt.logging.info(f"Miner starting at block: {self.block}")
+
+    def _stop_axon(self) -> None:
+        if not self._axon_started:
+            return
+        try:
+            self.axon.stop()
+        except Exception as e:
+            bt.logging.debug(f"axon stop: {e}")
+        self._axon_started = False
+
+    def _idle_until_registered(self) -> None:
+        """Block with minimal activity while deregistered."""
+        self._stop_axon()
+        self._on_subnet_deregistered()
+        poll = float(getattr(self.config.neuron, "deregistered_poll", DEREGISTERED_IDLE_POLL_S))
+        while not self.should_exit:
+            if self.refresh_registration():
+                self._on_subnet_registered()
+                return
+            time.sleep(max(30.0, poll))
 
     def run(self):
         """
@@ -122,48 +178,43 @@ class BaseMinerNeuron(BaseNeuron):
             Exception: For unforeseen errors during the miner's operation, which are logged for diagnosis.
         """
 
-        # Check that miner is registered on the network.
-        self.sync()
-
-        # Serve passes the axon information to the network + netuid we are hosting on.
-        # This will auto-update if the axon port of external ip have changed.
-        bt.logging.info(
-            f"Serving miner axon {self.axon} on network: {self.config.subtensor.chain_endpoint} with netuid: {self.config.netuid}"
-        )
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-
-        # Start  starts the miner's axon, making it active on the network.
-        self.axon.start()
-
-        bt.logging.info(f"Miner starting at block: {self.block}")
-
-        # This loop maintains the miner's operations until intentionally stopped.
         try:
             while not self.should_exit:
-                while (
-                    self.block - self.metagraph.last_update[self.uid]
-                    < self.config.neuron.epoch_length
-                ):
-                    # Wait before checking again.
-                    time.sleep(1)
-
-                    # Check if we should exit.
+                if not self.is_subnet_registered:
+                    self._idle_until_registered()
                     if self.should_exit:
                         break
 
-                # Sync metagraph and potentially set weights.
-                self.sync()
-                self.step += 1
+                self._start_axon()
+                if not self._axon_started:
+                    self._idle_until_registered()
+                    continue
 
-        # If someone intentionally stops the miner, it'll safely terminate operations.
+                while not self.should_exit and self.is_subnet_registered:
+                    while (
+                        self.block - self.metagraph.last_update[self.uid]
+                        < self.config.neuron.epoch_length
+                    ):
+                        time.sleep(1)
+                        if self.should_exit:
+                            break
+                    if self.should_exit:
+                        break
+
+                    self.sync()
+                    if not self.is_subnet_registered:
+                        break
+                    self.step += 1
+
         except KeyboardInterrupt:
-            self.axon.stop()
+            self._stop_axon()
             bt.logging.success("Miner killed by keyboard interrupt.")
             exit()
 
-        # In case of unforeseen errors, the miner will log the error and continue operations.
-        except Exception as e:
+        except Exception:
             bt.logging.error(traceback.format_exc())
+        finally:
+            self._stop_axon()
 
     def run_in_background_thread(self):
         """

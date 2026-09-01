@@ -182,22 +182,25 @@ class Miner(BaseMinerNeuron):
         self.triage_stage = None
 
         if _THIN:
-            from alpharidge_ai.utils.inference_client import InferencePoolClient
+            if self.is_subnet_registered:
+                from alpharidge_ai.utils.inference_client import InferencePoolClient
 
-            self.pool = InferencePoolClient()
-            try:
-                health = self.pool.health()
-                bt.logging.info(
-                    f"[Miner] Thin mode → pool {ar_config.INFERENCE_POOL_URL} health={health.get('ok')}"
-                )
-            except Exception as e:
-                _article_log(
-                    "pool_unavailable",
-                    reason=e,
-                    url=ar_config.INFERENCE_POOL_URL,
-                )
-                raise
-        else:
+                self.pool = InferencePoolClient()
+                try:
+                    health = self.pool.health()
+                    bt.logging.info(
+                        f"[Miner] Thin mode → pool {ar_config.INFERENCE_POOL_URL} health={health.get('ok')}"
+                    )
+                except Exception as e:
+                    _article_log(
+                        "pool_unavailable",
+                        reason=e,
+                        url=ar_config.INFERENCE_POOL_URL,
+                    )
+                    raise
+            else:
+                pass  # pool stays None; _on_subnet_deregistered logs once when run() idles
+        elif self.is_subnet_registered:
             # Initialize analyzer for tweet classification
             bt.logging.info("[Miner] Initializing analyzer...")
             self.analyzer = setup_analyzer()
@@ -257,6 +260,29 @@ class Miner(BaseMinerNeuron):
         hotkey = self.wallet.hotkey.ss58_address
         if not _THIN:
             bt.logging.info(f"[Miner] V3 miner started with hotkey: {hotkey}")
+
+    def _on_subnet_deregistered(self) -> None:
+        super()._on_subnet_deregistered()
+        if _THIN and not getattr(self, "_thin_idle_logged", False):
+            _article_log(
+                "deregistered_idle",
+                hotkey=self.wallet.hotkey.ss58_address[:16],
+            )
+            self._thin_idle_logged = True
+        self.pool = None
+
+    def _on_subnet_registered(self) -> None:
+        super()._on_subnet_registered()
+        self._thin_idle_logged = False
+        if _THIN and self.pool is None:
+            from alpharidge_ai.utils.inference_client import InferencePoolClient
+
+            self.pool = InferencePoolClient()
+            _article_log(
+                "registered_resume",
+                uid=self.uid,
+                hotkey=self.wallet.hotkey.ss58_address[:16],
+            )
 
     async def blacklist_tweet_batch(
         self, synapse: alpharidge_ai.protocol.TweetBatch
@@ -1057,6 +1083,5 @@ class Miner(BaseMinerNeuron):
 if __name__ == "__main__":
     with Miner() as miner:
         while True:
-            if not _THIN:
-                bt.logging.info(f"Miner running... {time.time()}")
-            time.sleep(5)
+            # Main thread stays alive for PM2; work runs in background thread.
+            time.sleep(3600)
